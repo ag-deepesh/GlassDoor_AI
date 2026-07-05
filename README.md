@@ -1,132 +1,166 @@
-# GlassBox — Milestone 2: full pipeline, evaluation-driven development
+# GlassBox
 
-Builds on Milestone 1 (parsing). This milestone adds every remaining
-stage — chunking, embedding, vector store, retrieval, reranking,
-generation — plus the evaluation layer and the orchestrator that ties it
-all together, runnable step-by-step or all at once.
+GlassBox is a "glass-box" RAG (Retrieval-Augmented Generation) training lab:
+a full retrieval + generation pipeline where every stage — parsing,
+chunking, embedding, retrieval, reranking, generation — is inspectable,
+swappable, and evaluated on its own, instead of hiding behind a single
+"ask a question, get an answer" black box.
 
-## What's here
+It ships as three things that share one Python core (`core/`):
+
+- **A FastAPI backend** (`api/`) that streams pipeline progress and stage
+  reports over SSE, backs a real vector store, and serves the query/analysis
+  endpoints.
+- **A React UI** (`frontend/`) — build a Knowledge Base, configure each
+  pipeline stage, run queries, and inspect the trace/evaluation/cost of
+  every run.
+- **A CLI** (`cli/`) — the same pipeline, runnable standalone with no UI or
+  server, stage-by-stage or all at once.
+
+## What the pipeline does
+
+1. **Parsing** — PDF, DOCX, PPTX, Markdown, and plain text, with optional
+   image extraction and Tesseract OCR for scanned pages.
+2. **Chunking** — fixed-size, recursive, sentence-aware, markdown-heading-aware,
+   or embedding-similarity-based semantic chunking.
+3. **Embedding** — local (MiniLM, BGE-small/M3) or hosted (Gemini,
+   OpenAI `text-embedding-3-*`) text embeddings, plus a separate image
+   pipeline (caption-then-embed, or local CLIP).
+4. **Vector store** — Chroma, with separate text and image collections
+   sharing a `doc_id`.
+5. **Retrieval** — semantic, keyword (BM25), or hybrid (Reciprocal Rank
+   Fusion), with an optional live web search (Tavily) blended in.
+6. **Reranking** — passthrough or a local cross-encoder.
+7. **ReAct loop** (optional) — an LLM judge (Claude, Gemini, GPT-4o-mini, or
+   Groq/Llama) critiques the retrieved context and can trigger another
+   retrieval pass before generation.
+8. **Generation** — Claude, Gemini, GPT-4o-mini, or Groq/Llama models.
+9. **Evaluation**, at every stage:
+   - Parsing/chunking/embedding/retrieval get **zero-cost heuristic
+     reports** (`core/evaluation/heuristics.py`) — no LLM tokens spent.
+   - Generation gets real **RAGAS metrics** (`core/evaluation/ragas_eval.py`):
+     Faithfulness, AnswerRelevancy, ContextPrecision reference-free, plus
+     ContextRecall/AnswerCorrectness/SemanticSimilarity if a gold answer is
+     supplied.
+
+Every stage's method registry is discoverable at runtime — run
+`python -m cli.main show-registry` or hit `GET /registry` on the backend.
+
+## Codebase layout
 
 ```
 core/
-  schemas.py            # + StageReport: {output, trace, eval_reference_free, eval_with_reference, acknowledged}
-  pipeline_config.py     # every dropdown/numeric-input choice, in one place -- also the "export config" shape
-  pipeline.py             # orchestrator: run_<stage>() one at a time, or run_all(interactive=True/False)
-  tokenizer.py             # ~4-chars/token approximation, no network dependency (tiktoken needs one)
+  pipeline.py           # orchestrator: run_<stage>() individually, or run_all()
+  pipeline_config.py    # every stage's configurable options, in one place
+  schemas.py            # StageReport: {output, trace, eval_*, acknowledged}
+  registry.py            # @register("stage", "method") decorator + lookup
+  tokenizer.py            # ~4-chars/token approximation, no network dependency
+  llm_clients.py           # one interface for Claude/Gemini/OpenAI/Groq: chat(),
+                            # caption_image(), rewrite_system_prompt(), suggest_option()
+  react_loop.py            # the optional judge-critiques-context refinement loop
+  web_search.py            # Tavily integration, degrades gracefully without a key
+  kb_store.py              # Knowledge Base persistence (metadata + uploads + assets)
 
-  chunking/
-    base.py, fixed.py, recursive.py, sentence.py, markdown_structure.py, semantic.py
-    # chunk_size/overlap are manual, default 512/64 (ChunkConfig)
-    # markdown_structure groups by heading hierarchy (reuses section_path from md_parser.py)
-    # semantic merges sentences while embedding-similarity stays high (embed_fn injectable for testing)
+  parsing/      # pdf, docx, pptx, md, txt + OCR, "assorted" auto-dispatches by extension
+  chunking/     # fixed, recursive, sentence, markdown_structure, semantic
+  embedding/    # text_local (MiniLM/BGE), text_gemini, text_openai, image_caption
+  vectorstore/  # chroma_store.py
+  retrieval/    # semantic, keyword (BM25), hybrid_rrf, multimodal result-mode logic
+  reranking/    # none (passthrough), cross-encoder
+  generation/   # thin per-provider wrappers over llm_clients
+  judge/        # per-provider judges used by the ReAct loop
+  evaluation/   # heuristics.py (free) + ragas_eval.py (real RAGAS) + diagnosis.py
 
-  embedding/
-    base.py, text_local.py (MiniLM-L6 default, BGE-small), text_gemini.py, text_openai.py (3-small/large)
-    image_caption.py        # caption-text-embed (default) + CLIP (local, advanced) -- registered as "image_embedding"
-    # BGE-M3 intentionally NOT registered yet, per your "leave it for now" call
+api/main.py     # FastAPI app: KB build/list/delete, query (SSE), rewrite/suggest, diagnose
+cli/main.py     # parse | chunk | run [--step] | show-registry
 
-  vectorstore/chroma_store.py   # two collections: text_chunks, image_assets, sharing doc_id
-
-  retrieval/
-    base.py, semantic.py, keyword.py (BM25), hybrid_rrf.py (Reciprocal Rank Fusion, k=60)
-    multimodal.py            # the "Result mode" control: text-only / joint / separate-merge
-    # top_k is manual everywhere, default 10
-
-  reranking/reranking.py    # none (passthrough), cross-encoder (local, ms-marco-MiniLM)
-  generation/generation.py   # claude-sonnet, gemini-2.5-flash/pro, gpt-4o-mini -- thin wrappers over llm_clients
-
-  llm_clients.py             # ONE interface for Claude/Gemini/OpenAI: chat(), caption_image(),
-                              # rewrite_system_prompt(), suggest_option() -- used by generation AND the UI's
-                              # "Rewrite with LLM" / "✦ Suggest" buttons
-
-  evaluation/
-    heuristics.py            # zero-cost, rule-based reports for parsing/chunking/embedding/retrieval
-    ragas_eval.py              # the actual `ragas` PyPI package for generation-stage metrics:
-                                #   reference-free: Faithfulness, AnswerRelevancy, ContextPrecisionWithoutReference
-                                #   +with-reference: ContextPrecisionWithReference, ContextRecall,
-                                #                    AnswerCorrectness, SemanticSimilarity
-
-cli/main.py    # parse | chunk | run [--step] | show-registry -- every stage runnable standalone
+frontend/src/
+  RAGLab.jsx    # the whole UI: Knowledge Base tab, Query Lab tab, Analysis tab
+  api.js        # fetch wrappers for every backend endpoint
 ```
 
-## A design decision worth explaining: where does RAGAS actually run?
+## Running it
 
-Full RAGAS metrics need a real *answer* to judge against — they don't
-cleanly apply to, say, chunking in isolation. So the eval-driven-development
-principle is split two ways, both giving "concise report + recommendation"
-at every stage, but through different mechanisms:
+### Prerequisites
 
-- **Parsing / Chunking / Embedding / Retrieval** → `heuristics.py`. Fast,
-  deterministic, rule-based, **zero LLM tokens spent**. E.g. chunking
-  reports mean/std token size and flags high variance; retrieval reports
-  score spread and flags a wide gap between top and bottom results.
-- **Generation** → `ragas_eval.py`. This is where a real answer exists, so
-  the actual `ragas` package runs Faithfulness / AnswerRelevancy /
-  ContextPrecision (+ the reference-based set if a gold answer is given).
+| | macOS | Windows |
+|---|---|---|
+| Python | 3.11 | 3.11 |
+| Node.js | 18+ | 18+ |
+| Tesseract (OCR) | `brew install tesseract` | [installer](https://github.com/UB-Mannheim/tesseract/wiki), add its dir to PATH |
+| [uv](https://docs.astral.sh/uv/) | `brew install uv` | `pip install uv` or the [installer](https://docs.astral.sh/uv/getting-started/installation/) |
 
-This means most of the pipeline's "evaluate every step" requirement costs
-nothing to run, and the one expensive LLM-judge call happens exactly once,
-at the end, where it's most meaningful — directly serving requirement 8
-(use tokens judiciously).
-
-## A real dependency conflict we hit and fixed
-
-Installing `ragas` fresh pulls in its own compatible `langchain-core` /
-`langchain` / `langchain-community` versions and imports cleanly. Installing
-`langchain-openai` or `langchain-anthropic` *first* pulls newer, incompatible
-`langchain-core` pins and breaks `ragas`'s imports. **Fix: install `ragas`
-first, then `langchain-anthropic` on top** — that's the order baked into
-`requirements.txt`. This is exactly the fragility flagged before choosing
-the real `ragas` package over a custom reimplementation — it's real, but
-resolved.
-
-Also: `ragas` 0.4.x's own metric classes (`Faithfulness`, `AnswerRelevancy`,
-etc.) take a native provider client directly via `ragas.llms.llm_factory`
-— **no langchain wrapper needed at the metric level** for Claude/OpenAI.
-`langchain-anthropic` is still required as a transitive import inside
-`ragas`'s judge-construction path in this version.
-
-## What's tested vs. what needs your Mac's internet + real keys
-
-This sandbox has restricted network access (no `huggingface.co`, no live
-LLM APIs) and no real API keys, so testing split into two tiers:
-
-✅ **Fully tested, offline, real data:**
-- All 6 parsers/chunkers on the 5-format sample corpus (Milestone 1 + this one)
-- `Pipeline.run_parsing()` and `run_chunking()` end-to-end, including their
-  heuristic eval reports
-- The registry (`show-registry` lists all 24 registered methods across 6 stages)
-- The step-by-step acknowledgment gate (`--step`, tested with piped input —
-  confirmed it actually halts on "n", not just a soft skip)
-- `ragas` + `langchain-anthropic` import cleanly together (the conflict above, resolved)
-- The CLI's error handling (confirmed it prints all completed stage reports
-  before a clear failure message, not a lost trace + raw stack)
-
-⚠️ **Structurally correct, needs your Mac to fully verify:**
-- `run_embedding()` onward — MiniLM/BGE-small download from `huggingface.co`
-  (blocked here, fine on your Mac)
-- Gemini/OpenAI embedding and all generation calls — need real API keys
-- `ragas_eval.get_judge()` — needs a real key to actually score
-
-## Try it yourself
+### Backend
 
 ```bash
-pip install -r requirements.txt
-brew install tesseract   # macOS, for OCR
+uv venv --python 3.11
+source .venv/bin/activate      # Windows: .venv\Scripts\Activate.ps1
 
-python3 -m cli.main show-registry
-python3 -m cli.main chunk sample_corpus --method markdown_structure --chunk-size 60 --overlap 10
+uv pip install -r requirements.txt
 
-# Full pipeline, all at once:
-python3 -m cli.main run sample_corpus -q "How does self-attention work?" \
-    --claude-key sk-ant-... 
-
-# Step-by-step, with acknowledgment required at each stage:
-python3 -m cli.main run sample_corpus -q "How does self-attention work?" \
-    --claude-key sk-ant-... --step
+uvicorn api.main:app --reload --port 8000
 ```
 
-## Next milestone (not built yet)
+Visit `http://127.0.0.1:8000/docs` for the Swagger UI, or
+`http://127.0.0.1:8000/registry` to confirm every stage's methods loaded.
 
-FastAPI app streaming `StageReport`s over SSE, and wiring the React UI
-(`rag-lab-mockup.jsx`) to this real backend instead of simulated data.
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Visit `http://localhost:5173` — it talks to the backend at
+`http://127.0.0.1:8000` by default (override with `VITE_API_BASE` in a
+`frontend/.env` file).
+
+### Using the UI
+
+1. **Knowledge Base** — attach documents (PDF/DOCX/PPTX/MD/TXT), configure
+   parsing/chunking/embedding, click **Build KB**. Stages stream in as they
+   complete; a built KB is reusable across queries without re-embedding.
+2. **Query Lab** — pick a KB, type a query, optionally toggle web search and
+   the ReAct loop, click **Run**. Add provider API keys via the **API keys**
+   button first.
+3. **Analysis** — inspect the per-stage trace, evaluation reports, and
+   token/cost breakdown for the run, or compare two runs side by side.
+
+### CLI (no UI or server needed)
+
+```bash
+python -m cli.main show-registry
+python -m cli.main run sample_corpus -q "How does self-attention work?" --claude-key sk-ant-...
+python -m cli.main run sample_corpus -q "..." --claude-key sk-ant-... --step   # pause after each stage
+python -m cli.main run sample_corpus -q "..." --claude-key sk-ant-... --web --tavily-key tvly-... --react
+```
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+Builds the backend (FastAPI + Chroma, `data/` mounted so KBs persist) and
+the frontend (static build served via nginx). See `Dockerfile.backend`,
+`Dockerfile.frontend`, `docker-compose.yml`. API keys are still typed into
+the running UI or passed as environment variables at deploy time — never
+baked into the image.
+
+For platform-specific setup notes (OneDrive/synced-folder caveats, moving
+KB data out of the repo, troubleshooting), see `SETUP.md`.
+
+## Screenshots
+
+**Knowledge Base — build pipeline**
+
+![Knowledge Base tab](docs/screenshots/knowledge-base.png)
+
+**Query Lab**
+
+![Query Lab tab](docs/screenshots/query-lab.png)
+
+**Analysis — trace/evaluation/compare**
+
+![Analysis tab](docs/screenshots/analysis.png)
