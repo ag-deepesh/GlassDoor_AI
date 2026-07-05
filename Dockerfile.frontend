@@ -1,0 +1,17 @@
+# Build the static Vite bundle, then serve it with nginx -- no Node runtime
+# needed at deploy time.
+FROM node:20-slim AS build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ .
+# VITE_API_BASE bakes the backend URL in at build time -- set it to wherever
+# the backend container/service is actually reachable in your deployment.
+ARG VITE_API_BASE=http://localhost:8000
+ENV VITE_API_BASE=$VITE_API_BASE
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

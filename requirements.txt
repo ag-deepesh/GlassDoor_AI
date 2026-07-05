@@ -1,0 +1,39 @@
+# Parsing (Milestone 1)
+pymupdf
+python-docx
+python-pptx
+markdown-it-py
+pytesseract
+pillow
+typer
+rich
+
+# Chunking / local embedding / reranking (Milestone 2)
+sentence-transformers      # pulls in torch (CPU) -- MiniLM, BGE-small, CLIP, cross-encoder all live here
+rank_bm25
+
+# Vector store
+chromadb
+
+# LLM provider SDKs (generation, captioning, prompt rewriting, suggestions)
+anthropic
+google-generativeai
+openai
+
+# Evaluation -- the actual RAGAS package (per your choice for exact library fidelity)
+# Pinned: ragas 0.4.x unconditionally imports langchain_community.chat_models.vertexai,
+# a submodule langchain-community has since dropped (it's being sunset) -- core/evaluation/
+# ragas_eval.py shims that one missing symbol at import time since we never use Vertex AI.
+ragas==0.4.3
+langchain-anthropic        # only needed if judge_provider="claude"; ragas itself only requires langchain-openai
+
+# API layer + web search (Milestone 3)
+fastapi
+uvicorn[standard]
+python-multipart           # required by FastAPI for multipart file uploads (KB creation)
+tavily-python
+
+# System dependency (not pip-installable): Tesseract OCR binary
+#   macOS:    brew install tesseract
+#   Windows:  https://github.com/UB-Mannheim/tesseract/wiki -- installer, then add its install dir to PATH
+#   Ubuntu:   sudo apt-get install tesseract-ocr

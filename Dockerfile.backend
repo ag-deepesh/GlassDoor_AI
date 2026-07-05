@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# Tesseract for the OCR toggle (core/parsing/ocr.py) -- everything else is
+# pure-Python or ships manylinux wheels, no other system deps needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY api/ api/
+COPY cli/ cli/
+COPY core/ core/
+
+# KB data (Chroma dirs + metadata.json) -- mount a volume here so KBs
+# persist across container restarts/rebuilds.
+ENV GLASSBOX_DATA_DIR=/data
+VOLUME ["/data"]
+
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

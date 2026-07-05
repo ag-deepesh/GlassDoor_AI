@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# KB persistence (Chroma dirs, uploads, per-KB metadata) -- can get large,
+# and shouldn't be diffed/synced through git.
+data/
+
+# Legacy CLI output dir (parsing/chunking dry-runs, sample run workdir)
+out/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Claude Code harness runtime state (not project config)
+.claude/scheduled_tasks.lock
+
+# Env / secrets -- API keys are entered in the running UI/CLI only, never
+# committed (see pipeline_config.py's api_keys rule).
+.env
+.env.*
