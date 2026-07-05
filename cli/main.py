@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
@@ -15,6 +16,8 @@ from core.chunking.base import ChunkConfig
 from core.pipeline import Pipeline
 from core.pipeline_config import PipelineConfig
 from core.schemas import StageError
+
+load_dotenv()  # local, gitignored .env -- so --*-key envvar options pick it up
 
 app = typer.Typer(help="GlassBox: a glass-box RAG/agent training lab.")
 console = Console()
@@ -107,6 +110,7 @@ def run(
     gemini_key: str = typer.Option(None, envvar="GOOGLE_API_KEY"),
     openai_key: str = typer.Option(None, envvar="OPENAI_API_KEY"),
     tavily_key: str = typer.Option(None, envvar="TAVILY_API_KEY"),
+    groq_key: str = typer.Option(None, envvar="GROQ_API_KEY"),
     generation_method: str = typer.Option("claude-sonnet"),
     embedding_method: str = typer.Option("minilm-l6"),
     retrieval_method: str = typer.Option("hybrid-rrf"),
@@ -126,7 +130,7 @@ def run(
         embedding_method=embedding_method, retrieval_method=retrieval_method, top_k=top_k,
         generation_method=generation_method, web_enabled=web, react_enabled=react,
         react_max_iterations=react_max_iterations, react_judge_method=react_judge_method,
-        api_keys={"claude": claude_key, "gemini": gemini_key, "openai": openai_key, "tavily": tavily_key},
+        api_keys={"claude": claude_key, "gemini": gemini_key, "openai": openai_key, "tavily": tavily_key, "groq": groq_key},
     )
     pipeline = Pipeline(cfg, workdir=Path("out/run"))
 

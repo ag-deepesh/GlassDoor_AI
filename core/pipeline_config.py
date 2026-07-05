@@ -53,8 +53,10 @@ class PipelineConfig:
     # API keys (kept in memory only -- never persisted with the config export)
     api_keys: dict = field(default_factory=dict)  # {"claude": "...", "gemini": "...", "openai": "...", "tavily": "..."}
 
-    # Evaluation (RAGAS judge -- distinct from react_judge_method above)
-    judge_provider: str = "claude"
+    # Evaluation (RAGAS judge -- distinct from react_judge_method above).
+    # None means "auto": match whatever provider generation used, so RAGAS
+    # never needs a key the user didn't already supply.
+    judge_provider: str | None = None
 
     # Image captioning (used by the caption-text-embed image embedding method)
     caption_provider: str = "claude"

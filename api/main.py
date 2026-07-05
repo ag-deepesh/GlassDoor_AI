@@ -23,10 +23,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import queue
 import threading
 from typing import AsyncIterator, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -39,6 +41,8 @@ from core.pipeline_config import PipelineConfig
 from core.registry import all_stages
 from core.schemas import StageReport, StageError
 
+load_dotenv()  # local, gitignored .env -- dev-only fallback, see _with_env_fallback()
+
 app = FastAPI(title="GlassBox API")
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +51,26 @@ app.add_middleware(
 )
 
 _SENTINEL = object()
+
+_ENV_KEY_VARS = {
+    "claude": "ANTHROPIC_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "tavily": "TAVILY_API_KEY",
+    "groq": "GROQ_API_KEY",
+}
+
+
+def _with_env_fallback(keys: dict) -> dict:
+    """UI-supplied keys always win. Falls back to the matching env var
+    (from a local, gitignored .env -- never committed, never sent to the
+    frontend) only for providers the caller didn't supply a key for, so the
+    backend/CLI can be tested end-to-end without pasting a key into the UI."""
+    merged = dict(keys)
+    for provider, var in _ENV_KEY_VARS.items():
+        if not merged.get(provider) and os.environ.get(var):
+            merged[provider] = os.environ[var]
+    return merged
 
 
 async def _bridge(worker) -> AsyncIterator:
@@ -109,6 +133,7 @@ async def build_kb(
     chunk_overlap: int = Form(64),
     embedding_method: str = Form("minilm-l6"),
     image_embedding_method: str = Form("caption-text-embed"),
+    caption_provider: str = Form("claude"),
     api_keys: str = Form("{}"),  # JSON-encoded {"claude": "...", "gemini": "...", "openai": "..."}
 ):
     try:
@@ -133,18 +158,27 @@ async def build_kb(
         parsing_method=parsing_method, extract_images=extract_images, ocr=ocr,
         chunking_method=chunking_method, chunk_size=chunk_size, chunk_overlap=chunk_overlap,
         embedding_method=embedding_method, image_embedding_method=image_embedding_method,
-        api_keys=keys,
+        caption_provider=caption_provider,
+        api_keys=_with_env_fallback(keys),
     )
 
     def worker(q: queue.Queue):
+        had_error = False
         try:
             pipeline = Pipeline(cfg, workdir=kb_path)  # constructed here -- same thread that will run every stage
             for item in pipeline.build_kb(uploads_dir):
+                had_error = had_error or isinstance(item, StageError)
                 q.put(item)
             q.put({"type": "done"})
         except Exception as e:
+            had_error = True
             q.put(e)
         finally:
+            # A failed build leaves no metadata.json -- kb_store.list_kbs()
+            # would never show it, but its name would stay taken forever.
+            # Wipe it so the dropdown and the name are both clean for a retry.
+            if had_error:
+                kb_store.delete_kb(name)
             q.put(_SENTINEL)
 
     return StreamingResponse(_sse(worker), media_type="text/event-stream")
@@ -170,7 +204,7 @@ class QueryRequest(BaseModel):
 
     generation_method: str = "claude-sonnet"
     system_prompt: Optional[str] = None
-    judge_provider: str = "claude"  # RAGAS judge -- distinct from react_judge_method above
+    judge_provider: Optional[str] = None  # RAGAS judge; None = auto-match generation_method's provider
 
 
 @app.post("/query")
@@ -190,7 +224,7 @@ def query(req: QueryRequest):
 
     def worker(q: queue.Queue):
         try:
-            pipeline = Pipeline.load(req.kb_name, api_keys=req.api_keys, **overrides)
+            pipeline = Pipeline.load(req.kb_name, api_keys=_with_env_fallback(req.api_keys), **overrides)
         except Exception as e:
             q.put(e)
             q.put(_SENTINEL)

@@ -53,3 +53,15 @@ class GeminiProGenerator(_ProviderGenerator):
 class OpenAIGenerator(_ProviderGenerator):
     _provider = "openai"
     _default_model = "gpt-4o-mini"
+
+
+@register("generation", "llama-3.1-8b-instant")
+class Llama8BGenerator(_ProviderGenerator):
+    _provider = "groq"
+    _default_model = "llama-3.1-8b-instant"
+
+
+@register("generation", "llama-4-scout")
+class LlamaScoutGenerator(_ProviderGenerator):
+    _provider = "groq"
+    _default_model = "meta-llama/llama-4-scout-17b-16e-instruct"

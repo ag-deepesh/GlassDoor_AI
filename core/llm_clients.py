@@ -36,6 +36,8 @@ PRICING = {
     "gemini-2.5-flash": (0.000075, 0.0003),
     "gemini-2.5-pro": (0.00125, 0.005),
     "gpt-4o-mini": (0.00015, 0.0006),
+    "llama-3.1-8b-instant": (0.00005, 0.00008),
+    "meta-llama/llama-4-scout-17b-16e-instruct": (0.00011, 0.00034),
 }
 
 
@@ -131,7 +133,40 @@ class OpenAIClient(BaseLLMClient):
                             _cost(model, u.prompt_tokens, u.completion_tokens))
 
 
-_PROVIDERS = {"claude": ClaudeClient, "gemini": GeminiClient, "openai": OpenAIClient}
+class GroqClient(BaseLLMClient):
+    """Groq's API is OpenAI-compatible, so this reuses the `openai` SDK
+    pointed at Groq's endpoint instead of pulling in a separate `groq`
+    package -- one fewer dependency for the same wire format."""
+    def __init__(self, api_key: str):
+        import openai
+        self._client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+    def chat(self, system: str, user: str, model: str = "llama-3.1-8b-instant", max_tokens: int = 1024) -> LLMResponse:
+        resp = self._client.chat.completions.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        u = resp.usage
+        return LLMResponse(resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens,
+                            _cost(model, u.prompt_tokens, u.completion_tokens))
+
+    def caption_image(self, image_path, model: str = "meta-llama/llama-4-scout-17b-16e-instruct") -> LLMResponse:
+        import base64
+        media_type = "image/png" if str(image_path).endswith("png") else "image/jpeg"
+        b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+        resp = self._client.chat.completions.create(
+            model=model, max_tokens=200,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "Caption this image in one factual sentence, for retrieval indexing."},
+                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}},
+            ]}],
+        )
+        u = resp.usage
+        return LLMResponse(resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens,
+                            _cost(model, u.prompt_tokens, u.completion_tokens))
+
+
+_PROVIDERS = {"claude": ClaudeClient, "gemini": GeminiClient, "openai": OpenAIClient, "groq": GroqClient}
 
 
 def get_client(provider: str, api_key: str) -> BaseLLMClient:
@@ -148,6 +183,7 @@ REWRITE_GUIDELINES = {
     "claude": "Best for precise, structure-preserving rewrites -- use when the prompt already has a shape you want kept.",
     "gemini": "Fastest and cheapest -- use for quick iteration when you'll throw away most drafts.",
     "openai": "Good middle ground -- use when you want a second opinion different from Claude/Gemini's house style.",
+    "groq": "Fastest and cheapest of all -- Groq's inference speed makes it best for rapid iteration or high-volume runs.",
 }
 
 

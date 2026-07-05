@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, isValidElement, Fragment } from "react";
 import { getRegistry, getKbs, deleteKb, buildKb, runQuery, rewritePrompt, suggestOption } from "./api.js";
 
 // ---------- Design tokens ----------
@@ -20,7 +20,8 @@ const CAPABILITY = {
                "openai-text-embedding-3-small": "text", "openai-text-embedding-3-large": "text" },
   retrieval: { semantic: "both", keyword: "text", "hybrid-rrf": "both" },
   reranking: { none: "both", "cross-encoder": "text" },
-  generation: { "claude-sonnet": "both", "gemini-2.5-flash": "both", "gemini-2.5-pro": "both", "gpt-4o-mini": "both" },
+  generation: { "claude-sonnet": "both", "gemini-2.5-flash": "both", "gemini-2.5-pro": "both", "gpt-4o-mini": "both",
+                "llama-3.1-8b-instant": "text", "llama-4-scout": "both" },
 };
 const CapTag = ({ cap }) => (
   <span style={{
@@ -38,7 +39,7 @@ const STAGE_LABELS = {
 const DEFAULT_CONFIG = {
   parsing_method: "assorted", extract_images: true, ocr: false,
   chunking_method: "recursive", chunk_size: 512, chunk_overlap: 64,
-  embedding_method: "minilm-l6", image_embedding_method: "caption-text-embed",
+  embedding_method: "minilm-l6", image_embedding_method: "caption-text-embed", caption_provider: "claude",
   retrieval_method: "hybrid-rrf", top_k: 10, result_mode: "text-only", web_enabled: false,
   reranking_method: "cross-encoder", rerank_keep_top: 4,
   react_enabled: false, react_max_iterations: 3, react_judge_method: "gemini-2.5-flash",
@@ -48,7 +49,7 @@ const DEFAULT_CONFIG = {
 const RESULT_MODES = ["text-only", "joint", "separate-merge"];
 const RESULT_MODE_LABELS = { "text-only": "Text only", joint: "Text + Images (joint rank)", "separate-merge": "Text + Images (separate, merge top-k)" };
 const IMAGE_EMBED_OPTIONS = ["caption-text-embed", "clip-local"];
-const PROVIDERS = ["claude", "gemini", "openai"];
+const PROVIDERS = ["claude", "gemini", "openai", "groq"];
 const REWRITE_GUIDELINES = {
   claude: "Best for precise, structure-preserving rewrites — use when the prompt already has a shape you want kept.",
   gemini: "Fastest and cheapest — use for quick iteration when you'll throw away most drafts.",
@@ -182,6 +183,53 @@ function LearnDrawer({ content }) {
   );
 }
 
+// ---------- Per-stage data panel: parsed docs / chunks / retrieved & reranked items ----------
+function ItemsRow({ label, meta, text, rationale }) {
+  const [open, setOpen] = useState(false);
+  const preview = text.length > 150 ? text.slice(0, 150) + "…" : text;
+  return (
+    <div onClick={() => setOpen(o => !o)} style={{ padding: "8px 10px", borderBottom: `1px solid ${T.line}`, cursor: "pointer" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+        <span style={{ fontFamily: T.mono, fontSize: 11, fontWeight: 700, color: T.ink }}>{label}</span>
+        {meta.map((m, i) => isValidElement(m) ? <Fragment key={i}>{m}</Fragment> : <Chip key={i}>{m}</Chip>)}
+        <span style={{ marginLeft: "auto", fontFamily: T.mono, fontSize: 10, color: T.sub }}>{open ? "▾" : "▸"}</span>
+      </div>
+      {rationale && <div style={{ marginTop: 3, fontSize: 11, color: T.sub, fontStyle: "italic" }}>{rationale}</div>}
+      <div style={{ marginTop: 4, fontSize: 12, color: T.sub, whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+        {open ? text : preview}
+      </div>
+    </div>
+  );
+}
+
+function ItemsPanel({ id, items }) {
+  return (
+    <div style={{ margin: "6px 0 0", background: "#FAFCFE", border: `1px solid ${T.line}`, borderRadius: 8, maxHeight: 360, overflowY: "auto" }}>
+      {items.map((it, i) => {
+        if (id === "parsing") {
+          return <ItemsRow key={it.doc_id} label={it.doc_id} meta={[it.format, `${it.n_pages} pages`, `${it.n_words} words`]} text={it.text} />;
+        }
+        if (id === "chunking") {
+          return <ItemsRow key={it.chunk_id} label={it.chunk_id} meta={[it.doc_id, it.page != null ? `page ${it.page}` : null, `${it.n_tokens} tok`].filter(Boolean)} text={it.text} />;
+        }
+        // retrieval / reranking
+        const meta = [`score ${it.score}`, it.kind];
+        if (it.rank_change != null) {
+          const up = it.rank_change > 0;
+          meta.push(
+            <Chip key="rc" color={up ? "#1B7A4A" : it.rank_change < 0 ? "#B4483A" : T.accent}
+                  bg={up ? "#E4F5EC" : it.rank_change < 0 ? "#FBEAE7" : T.accentSoft}>
+              {up ? `↑${it.rank_change}` : it.rank_change < 0 ? `↓${-it.rank_change}` : "–"}
+            </Chip>
+          );
+        }
+        const rationale = it.matched_terms?.length ? `matched: ${it.matched_terms.join(", ")}` : null;
+        return <ItemsRow key={`${it.id}-${i}`} label={`#${it.rank} ${it.id}`} meta={meta} text={it.text} rationale={rationale} />;
+      })}
+    </div>
+  );
+}
+
 // ---------- Stage card ----------
 function StageCard({ id, idx, method, methodOptions, status, error, onSelectMethod, onSuggest, suggestion, onManage,
                      trace, expanded, onToggle, learnOpen, onLearnToggle, config, onConfigChange, runMode,
@@ -189,6 +237,8 @@ function StageCard({ id, idx, method, methodOptions, status, error, onSelectMeth
   const live = status === "running", done = status === "done", skipped = status === "skipped";
   const needsAck = runMode === "step" && done && !error;
   const label = STAGE_LABELS[id];
+  const [dataOpen, setDataOpen] = useState(false);
+  const hasItems = ["parsing", "chunking", "retrieval", "reranking"].includes(id) && output?.items?.length > 0;
 
   return (
     <div style={{ display: "flex", gap: 14, opacity: skipped ? 0.5 : 1 }}>
@@ -246,6 +296,14 @@ function StageCard({ id, idx, method, methodOptions, status, error, onSelectMeth
               style={{ marginLeft: 6, fontSize: 12, padding: "3px 6px", borderRadius: 6, border: `1px solid ${T.line}` }}>
               {IMAGE_EMBED_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
             </select>
+            {config.image_embedding_method === "caption-text-embed" && (
+              <span style={{ marginLeft: 14 }}>
+                Caption provider: <select value={config.caption_provider} onChange={e => onConfigChange("caption_provider", e.target.value)}
+                  style={{ marginLeft: 6, fontSize: 12, padding: "3px 6px", borderRadius: 6, border: `1px solid ${T.line}` }}>
+                  {PROVIDERS.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+              </span>
+            )}
           </div>
         )}
         {id === "chunking" && (
@@ -306,9 +364,15 @@ function StageCard({ id, idx, method, methodOptions, status, error, onSelectMeth
             <button onClick={onToggle} style={{ background: "none", border: "none", cursor: "pointer", fontFamily: T.mono, fontSize: 11, color: T.accent, padding: 0 }}>
               {live ? "● streaming…" : expanded ? "▾ trace" : "▸ trace"}
             </button>
+            {done && hasItems && (
+              <button onClick={() => setDataOpen(o => !o)} style={{ background: "none", border: "none", cursor: "pointer", fontFamily: T.mono, fontSize: 11, color: T.accent, padding: 0, marginLeft: 14 }}>
+                {dataOpen ? "▾ data" : "▸ data"}
+              </button>
+            )}
             {(done || error) && expanded && (
               <pre style={{ margin: "6px 0 0", background: "#0F1B2D", color: "#C7E5EE", borderRadius: 8, padding: 12, fontFamily: T.mono, fontSize: 11.5, whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{trace}</pre>
             )}
+            {done && hasItems && dataOpen && <ItemsPanel id={id} items={output.items} />}
             {error && <ErrorCard error={error} />}
             {done && output && <EvalReport evalFree={output.evalFree} rec={output.rec} needsAck={needsAck} acknowledged={acknowledged} onAck={onAck} />}
           </div>
@@ -403,7 +467,7 @@ export default function RAGLab() {
   const [newOpt, setNewOpt] = useState("");
 
   const [keysOpen, setKeysOpen] = useState(false);
-  const [keys, setKeys] = useState({ claude: "", gemini: "", openai: "", tavily: "" });
+  const [keys, setKeys] = useState({ claude: "", gemini: "", openai: "", groq: "", tavily: "" });
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [rewriteProvider, setRewriteProvider] = useState("claude");
   const [rewriting, setRewriting] = useState(false);
@@ -482,6 +546,7 @@ export default function RAGLab() {
           parsing_method: config.parsing_method, extract_images: config.extract_images, ocr: config.ocr,
           chunking_method: config.chunking_method, chunk_size: config.chunk_size, chunk_overlap: config.chunk_overlap,
           embedding_method: config.embedding_method, image_embedding_method: config.image_embedding_method,
+          caption_provider: config.caption_provider,
         },
       }, (item) => {
         if (item.type === "done") return;
@@ -489,7 +554,7 @@ export default function RAGLab() {
           ...p,
           [item.stage]: item.type === "error"
             ? { status: "done", error: item }
-            : { status: "done", output: { out: item.output_preview, lat: item.trace.latency_ms, cost: item.trace.cost_usd, tok: item.trace.tokens, evalFree: item.eval_reference_free, rec: item.eval_reference_free?.recommendation, trace: item.trace } },
+            : { status: "done", output: { out: item.output_preview, lat: item.trace.latency_ms, cost: item.trace.cost_usd, tok: item.trace.tokens, evalFree: item.eval_reference_free, rec: item.eval_reference_free?.recommendation, trace: item.trace, items: item.trace.extra?.items } },
         }));
         setExpanded(p => ({ ...p, [item.stage]: true }));
       });
@@ -521,7 +586,7 @@ export default function RAGLab() {
       ...p,
       [item.stage]: item.type === "error"
         ? { status: "done", error: item }
-        : { status: "done", output: { out: item.output_preview, lat: item.trace.latency_ms, cost: item.trace.cost_usd, tok: item.trace.tokens, evalFree: item.eval_reference_free, rec: item.eval_reference_free?.recommendation, trace: item.trace } },
+        : { status: "done", output: { out: item.output_preview, lat: item.trace.latency_ms, cost: item.trace.cost_usd, tok: item.trace.tokens, evalFree: item.eval_reference_free, rec: item.eval_reference_free?.recommendation, trace: item.trace, items: item.trace.extra?.items } },
     }));
     setExpanded(p => ({ ...p, [item.stage]: true }));
   };
@@ -626,13 +691,13 @@ export default function RAGLab() {
           <span style={{ padding: "5px 14px", borderRadius: 99, fontSize: 12.5, opacity: .45 }}>Agent Eval · soon</span>
         </div>
         <button onClick={() => setKeysOpen(o => !o)} style={{ marginLeft: "auto", background: "none", border: "1px solid #2E4B66", color: "#9FD9E8", padding: "6px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12.5 }}>
-          {keys.claude || keys.gemini || keys.openai || keys.tavily ? "🔑 Keys set" : "🔑 API keys"}
+          {keys.claude || keys.gemini || keys.openai || keys.groq || keys.tavily ? "🔑 Keys set" : "🔑 API keys"}
         </button>
       </div>
 
       {keysOpen && (
         <div style={{ background: "#fff", borderBottom: `1px solid ${T.line}`, padding: "14px 20px", display: "flex", gap: 12, flexWrap: "wrap" }}>
-          {[["claude", "Anthropic key (Claude Sonnet)"], ["gemini", "Google key (Gemini)"], ["openai", "OpenAI key (GPT-4o / text-embedding-3-*)"], ["tavily", "Tavily key (web search)"]].map(([k, label]) => (
+          {[["claude", "Anthropic key (Claude Sonnet)"], ["gemini", "Google key (Gemini)"], ["openai", "OpenAI key (GPT-4o / text-embedding-3-*)"], ["groq", "Groq key (Llama 3.1/4 via Groq)"], ["tavily", "Tavily key (web search)"]].map(([k, label]) => (
             <label key={k} style={{ fontSize: 12, color: T.sub, display: "flex", flexDirection: "column", gap: 4, flex: 1, minWidth: 220 }}>
               {label}
               <input type="password" placeholder="stored in session only" value={keys[k]}

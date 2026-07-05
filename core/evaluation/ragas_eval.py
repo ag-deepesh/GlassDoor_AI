@@ -66,27 +66,39 @@ class EvalReport:
 # ---- Provider-agnostic judge construction --------------------------------
 
 def _native_client(provider: str, api_key: str):
+    # ragas 0.4.x's Instructor adapter drives .score() through its async
+    # ascore() path, so these must be async clients -- a sync client raises
+    # "Cannot use agenerate() with a synchronous client" at score time.
     if provider == "claude":
         import anthropic
-        return anthropic.Anthropic(api_key=api_key), "claude-sonnet-4-6"
+        return anthropic.AsyncAnthropic(api_key=api_key), "claude-sonnet-4-6"
     if provider == "openai":
         import openai
-        return openai.OpenAI(api_key=api_key), "gpt-4o-mini"
+        return openai.AsyncOpenAI(api_key=api_key), "gpt-4o-mini"
+    if provider == "groq":
+        # Groq's API is OpenAI-compatible -- same client used elsewhere in this
+        # codebase for Groq generation (core/llm_clients.py), so ragas's
+        # instructor/openai adapter works against it with no extra dependency.
+        import openai
+        return openai.AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1"), "llama-3.1-8b-instant"
     if provider == "gemini":
-        # ragas auto-selects the LiteLLM adapter for Google models.
-        from litellm import completion  # noqa: F401 -- import validates litellm is installed
-        import openai as _openai_shim  # litellm exposes an OpenAI-compatible client for this path
-        raise NotImplementedError(
-            "Gemini as the RAGAS judge needs the litellm adapter wired to a live key; "
-            "use --judge-provider claude or openai for now, or see README for the Gemini path."
-        )
+        # Google's OpenAI-compatible endpoint sidesteps the litellm/google-genai
+        # SDK adapter path (which needs extra deps and has known instructor
+        # issues); same trick as Groq above.
+        import openai
+        return openai.AsyncOpenAI(
+            api_key=api_key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        ), "gemini-2.5-flash"
     raise ValueError(f"Unknown judge provider '{provider}'")
 
 
 def get_judge(provider: str, api_key: str, model: str | None = None):
     """Returns (llm, embeddings) ready to hand to ragas metric constructors."""
     client, default_model = _native_client(provider, api_key)
-    llm = llm_factory(model or default_model, provider="anthropic" if provider == "claude" else provider, client=client)
+    # Only Claude uses its native anthropic client/adapter; openai, groq, and
+    # gemini all go through OpenAI-compatible clients above.
+    llm_provider = "anthropic" if provider == "claude" else "openai"
+    llm = llm_factory(model or default_model, provider=llm_provider, client=client)
     # Embeddings for AnswerRelevancy/AnswerCorrectness/SemanticSimilarity: local
     # MiniLM by default so scoring doesn't burn extra API-embedding cost/tokens.
     embeddings = HuggingFaceEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")

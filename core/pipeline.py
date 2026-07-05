@@ -28,6 +28,29 @@ from typing import Callable, Iterator
 from core.schemas import StageReport, StageError, TraceEvent
 from core.pipeline_config import PipelineConfig
 from core.registry import get
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "for",
+    "and", "or", "what", "how", "why", "does", "do", "did", "which", "that",
+    "this", "with", "by", "as", "at", "be", "it", "its", "from", "can", "will",
+}
+
+
+def _matched_terms(query: str, text: str, limit: int = 5) -> list[str]:
+    """Cheap, zero-LLM-cost rationale for why a chunk scored the way it did --
+    the query terms it actually contains. No semantic claim, just surfacing
+    the lexical overlap a human can sanity-check against the score."""
+    query_terms = [w.strip(".,?!:;\"'()").lower() for w in query.split()]
+    query_terms = [w for w in query_terms if len(w) > 2 and w not in _STOPWORDS]
+    text_lower = text.lower()
+    seen, matched = set(), []
+    for term in query_terms:
+        if term not in seen and term in text_lower:
+            seen.add(term)
+            matched.append(term)
+        if len(matched) == limit:
+            break
+    return matched
 from core import kb_store
 from core.parsing.assorted import EXT_TO_METHOD
 from core.chunking.base import ChunkConfig
@@ -45,7 +68,7 @@ from core.embedding import text_local as _tl, text_gemini as _tg, text_openai as
 from core.reranking import reranking as _rr  # noqa: F401
 from core.generation import generation as _gen  # noqa: F401
 from core.retrieval import semantic as _rs, keyword as _rk, hybrid_rrf as _rh  # noqa: F401
-from core.judge import gemini as _jg, claude as _jc, openai as _jo  # noqa: F401
+from core.judge import gemini as _jg, claude as _jc, openai as _jo, groq as _jgr  # noqa: F401
 
 
 def _hint_for(stage: str, error: Exception) -> str:
@@ -59,7 +82,7 @@ def _hint_for(stage: str, error: Exception) -> str:
     if "Connection" in type(error).__name__ or "Timeout" in type(error).__name__:
         return "A network call failed -- check your internet connection and that the relevant API key is valid."
     msg = str(error).lower()
-    if "api_key" in msg or "auth" in msg or "credentials" in msg or "unauthorized" in msg:
+    if "api_key" in msg or "api key" in msg or "auth" in msg or "credentials" in msg or "unauthorized" in msg:
         return "Missing or invalid API key for this stage's provider -- check the API keys panel and try again."
     return f"{stage.capitalize()} stopped -- check the '{stage}' configuration and inputs, then retry."
 
@@ -102,12 +125,42 @@ class Pipeline:
         return StageReport(stage=stage, method=method, output_preview=output_summary, trace=trace,
                             eval_reference_free=ref_free, eval_with_reference=ref_based)
 
+    @staticmethod
+    def _items_for_trace(items: list[RetrievedItem], query: str | None = None,
+                          prev_items: list[RetrievedItem] | None = None) -> list[dict]:
+        """Rank + score-sorted item dicts for the UI's per-stage 'data'
+        panel -- same shape for retrieval and reranking so the UI can
+        render both with one component. When query is given, each item also
+        gets a rule-based rationale (matched query terms, and -- when
+        prev_items is given, i.e. this is post-rerank -- its rank shift
+        versus the pre-rerank order), all zero-cost, no extra LLM call."""
+        ranked = sorted(items, key=lambda i: i.score, reverse=True)
+        prev_rank = None
+        if prev_items is not None:
+            prev_ranked = sorted(prev_items, key=lambda i: i.score, reverse=True)
+            prev_rank = {it.id: i + 1 for i, it in enumerate(prev_ranked)}
+        out = []
+        for i, it in enumerate(ranked):
+            d = {"rank": i + 1, "id": it.id, "kind": it.kind, "score": round(it.score, 4), "text": it.text}
+            if query is not None:
+                d["matched_terms"] = _matched_terms(query, it.text)
+            if prev_rank is not None:
+                old_rank = prev_rank.get(it.id)
+                d["rank_change"] = None if old_rank is None else old_rank - (i + 1)
+            out.append(d)
+        return out
+
     def _make_embedder(self):
         cfg = self.config
         embedder_cls = get("embedding", cfg.embedding_method)
         needs_key = cfg.embedding_method.startswith(("gemini", "openai"))
+        if not needs_key:
+            return embedder_cls()
         provider = "gemini" if cfg.embedding_method.startswith("gemini") else "openai"
-        return embedder_cls(cfg.api_keys[provider]) if needs_key else embedder_cls()
+        api_key = cfg.api_keys.get(provider)
+        if not api_key:
+            raise ValueError(f"Missing {provider} API key -- add it in the API keys panel and try again.")
+        return embedder_cls(api_key)
 
     def _save_kb_metadata(self, input_dir: Path) -> None:
         n_images = sum(len(d.images) for d in self.docs)
@@ -137,8 +190,14 @@ class Pipeline:
 
         report = heuristics.parsing_report(self.docs)
         total_words = sum(len(d.full_text.split()) for d in self.docs)
-        return self._report("parsing", cfg.parsing_method, t0, f"{len(paths)} files",
-                             f"{len(self.docs)} docs, {total_words} words", ref_free=report)
+        out = self._report("parsing", cfg.parsing_method, t0, f"{len(paths)} files",
+                            f"{len(self.docs)} docs, {total_words} words", ref_free=report)
+        out.trace.extra["items"] = [
+            {"doc_id": d.doc_id, "format": d.format, "n_pages": d.n_pages,
+             "n_words": len(d.full_text.split()), "text": d.full_text}
+            for d in self.docs
+        ]
+        return out
 
     def run_chunking(self) -> StageReport:
         t0 = time.time()
@@ -148,8 +207,13 @@ class Pipeline:
         self.chunks = [c for doc in self.docs for c in chunker.chunk(doc)]
 
         report = heuristics.chunking_report(self.chunks, cfg.chunk_size)
-        return self._report("chunking", cfg.chunking_method, t0, f"{len(self.docs)} docs",
-                             f"{len(self.chunks)} chunks", ref_free=report)
+        out = self._report("chunking", cfg.chunking_method, t0, f"{len(self.docs)} docs",
+                            f"{len(self.chunks)} chunks", ref_free=report)
+        out.trace.extra["items"] = [
+            {"chunk_id": c.chunk_id, "doc_id": c.doc_id, "page": c.page, "n_tokens": c.n_tokens, "text": c.text}
+            for c in self.chunks
+        ]
+        return out
 
     def run_embedding(self) -> StageReport:
         t0 = time.time()
@@ -163,8 +227,10 @@ class Pipeline:
         n_images = sum(len(d.images) for d in self.docs)
         if n_images and cfg.image_embedding_method == "caption-text-embed":
             from core.embedding.image_caption import CaptionThenEmbed
-            img_embedder = CaptionThenEmbed(self.text_embedder, cfg.caption_provider,
-                                             cfg.api_keys[cfg.caption_provider])
+            caption_key = cfg.api_keys.get(cfg.caption_provider)
+            if not caption_key:
+                raise ValueError(f"Missing {cfg.caption_provider} API key -- add it in the API keys panel and try again.")
+            img_embedder = CaptionThenEmbed(self.text_embedder, cfg.caption_provider, caption_key)
             all_images = [img for d in self.docs for img in d.images]
             img_vectors = img_embedder.embed_images(all_images)
             self.store.add_images(all_images, img_vectors)
@@ -219,6 +285,7 @@ class Pipeline:
                             cost=web_cost, ref_free=report)
         if web_warning:
             out.trace.extra["web_warning"] = web_warning
+        out.trace.extra["items"] = self._items_for_trace(self.retrieved, query=query)
         return out
 
     def run_reranking(self, query: str) -> StageReport:
@@ -226,11 +293,14 @@ class Pipeline:
         cfg = self.config
         reranker_cls = get("reranking", cfg.reranking_method)
         reranker = reranker_cls()
+        pre_rerank = self.retrieved
         self.reranked = reranker.rerank(query, self.retrieved, keep_top=cfg.rerank_keep_top)
 
         report = heuristics.retrieval_report(self.reranked)  # same shape of report, post-rerank
-        return self._report("reranking", cfg.reranking_method, t0, f"{len(self.retrieved)} candidates",
-                             f"{len(self.reranked)} kept", ref_free=report)
+        out = self._report("reranking", cfg.reranking_method, t0, f"{len(self.retrieved)} candidates",
+                            f"{len(self.reranked)} kept", ref_free=report)
+        out.trace.extra["items"] = self._items_for_trace(self.reranked, query=query, prev_items=pre_rerank)
+        return out
 
     def run_generation(self, query: str, reference: str | None = None) -> StageReport:
         t0 = time.time()
@@ -242,15 +312,21 @@ class Pipeline:
         self.answer = resp.text
 
         ref_free, ref_based = None, None
-        try:
-            from core.evaluation.ragas_eval import get_judge, reference_free_report, reference_based_report
-            judge = get_judge(cfg.judge_provider, cfg.api_keys[cfg.judge_provider])
-            contexts = [i.text for i in self.reranked]
-            ref_free = reference_free_report(query, contexts, self.answer, judge).as_dict()
-            if reference:
-                ref_based = reference_based_report(query, contexts, self.answer, reference, judge).as_dict()
-        except Exception as e:  # RAGAS/judge is best-effort -- generation output still stands without it
-            ref_free = {"scores": {}, "recommendation": f"RAGAS scoring unavailable this run: {e}"}
+        judge_provider = cfg.judge_provider or provider  # auto-match generation's provider by default
+        judge_key = cfg.api_keys.get(judge_provider)
+        if not judge_key:
+            ref_free = {"scores": {}, "recommendation":
+                        f"RAGAS scoring skipped: no API key configured for judge provider '{judge_provider}'."}
+        else:
+            try:
+                from core.evaluation.ragas_eval import get_judge, reference_free_report, reference_based_report
+                judge = get_judge(judge_provider, judge_key)
+                contexts = [i.text for i in self.reranked]
+                ref_free = reference_free_report(query, contexts, self.answer, judge).as_dict()
+                if reference:
+                    ref_based = reference_based_report(query, contexts, self.answer, reference, judge).as_dict()
+            except Exception as e:  # RAGAS/judge is best-effort -- generation output still stands without it
+                ref_free = {"scores": {}, "recommendation": f"RAGAS scoring unavailable this run: {e}"}
 
         return self._report("generation", cfg.generation_method, t0, f"query: {query[:60]}",
                              self.answer[:200], tokens=resp.input_tokens + resp.output_tokens,
