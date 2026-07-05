@@ -26,12 +26,13 @@ import json
 import os
 import queue
 import threading
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from core import kb_store, llm_clients
@@ -40,13 +41,14 @@ from core.pipeline import Pipeline
 from core.pipeline_config import PipelineConfig
 from core.registry import all_stages
 from core.schemas import StageReport, StageError
+from core.evaluation.diagnosis import diagnose, deep_dive
 
 load_dotenv()  # local, gitignored .env -- dev-only fallback, see _with_env_fallback()
 
 app = FastAPI(title="GlassBox API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # Vite dev server
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",  # Vite dev server (any local port)
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -103,6 +105,14 @@ async def _sse(worker) -> AsyncIterator[str]:
         yield _to_sse(item)
 
 
+@app.get("/config/providers")
+def available_providers():
+    """Which providers already have a usable key from the server's .env --
+    booleans only, the actual values never leave the backend -- so the UI
+    can skip prompting for a key it doesn't actually need."""
+    return {provider: bool(os.environ.get(var)) for provider, var in _ENV_KEY_VARS.items()}
+
+
 @app.get("/registry")
 def get_registry():
     """Every registered method per stage -- what each dropdown should show."""
@@ -119,6 +129,27 @@ def list_kbs():
 def delete_kb(name: str):
     kb_store.delete_kb(name)
     return {"ok": True}
+
+
+@app.get("/kbs/{name}/images/{image_id}")
+def get_kb_image(name: str, image_id: str):
+    """Serves the actual bytes for an image cited in a retrieval/reranking/
+    generation trace (e.g. 'transformer_notes_img2'), so the UI can render a
+    real thumbnail instead of just the caption text it was retrieved with."""
+    if not kb_store.kb_exists(name):
+        raise HTTPException(404, f"No KB named '{name}'.")
+    from core.vectorstore.chroma_store import ChromaStore
+    store = ChromaStore(kb_store.kb_path(name) / "chroma")
+    got = store.images.get(ids=[image_id])
+    if not got["ids"]:
+        raise HTTPException(404, f"No image '{image_id}' in KB '{name}'.")
+    path = Path(got["metadatas"][0]["path"]).resolve()
+    assets_dir = (kb_store.kb_path(name) / "assets").resolve()
+    if assets_dir not in path.parents:
+        raise HTTPException(400, "Image path is outside this KB's assets directory.")
+    if not path.is_file():
+        raise HTTPException(404, "Image file no longer exists on disk.")
+    return FileResponse(path)
 
 
 @app.post("/kbs/build")
@@ -184,6 +215,11 @@ async def build_kb(
     return StreamingResponse(_sse(worker), media_type="text/event-stream")
 
 
+class ChatMessage(BaseModel):
+    role: str   # "user" | "assistant"
+    content: str
+
+
 class QueryRequest(BaseModel):
     kb_name: str
     query: str
@@ -194,9 +230,11 @@ class QueryRequest(BaseModel):
     top_k: int = 10
     result_mode: str = "text-only"
     web_enabled: bool = False
+    image_candidate_k: int = 8
 
     reranking_method: str = "cross-encoder"
     rerank_keep_top: int = 4
+    vision_rerank_enabled: bool = False
 
     react_enabled: bool = False
     react_max_iterations: int = 3
@@ -205,6 +243,18 @@ class QueryRequest(BaseModel):
     generation_method: str = "claude-sonnet"
     system_prompt: Optional[str] = None
     judge_provider: Optional[str] = None  # RAGAS judge; None = auto-match generation_method's provider
+    vision_grounded: bool = False
+
+    # Prior conversation turns, oldest first -- the UI keeps this client-side
+    # and sends the last N (its "history turns to keep" setting) each call.
+    history: list[ChatMessage] = []
+
+    # Generation sampling params -- always explicit defaults, never silently
+    # left to the provider's own default.
+    temperature: float = 0.7
+    top_p: float = 1.0
+    gen_top_k: int = 40
+    max_tokens: int = 1024
 
 
 @app.post("/query")
@@ -214,10 +264,14 @@ def query(req: QueryRequest):
 
     overrides = dict(
         retrieval_method=req.retrieval_method, top_k=req.top_k, result_mode=req.result_mode,
-        web_enabled=req.web_enabled, reranking_method=req.reranking_method, rerank_keep_top=req.rerank_keep_top,
+        web_enabled=req.web_enabled, image_candidate_k=req.image_candidate_k,
+        reranking_method=req.reranking_method, rerank_keep_top=req.rerank_keep_top,
+        vision_rerank_enabled=req.vision_rerank_enabled,
         react_enabled=req.react_enabled, react_max_iterations=req.react_max_iterations,
         react_judge_method=req.react_judge_method, generation_method=req.generation_method,
-        judge_provider=req.judge_provider,
+        judge_provider=req.judge_provider, vision_grounded=req.vision_grounded,
+        history=[m.model_dump() for m in req.history],
+        temperature=req.temperature, top_p=req.top_p, gen_top_k=req.gen_top_k, max_tokens=req.max_tokens,
     )
     if req.system_prompt:
         overrides["system_prompt"] = req.system_prompt
@@ -232,17 +286,22 @@ def query(req: QueryRequest):
 
         total_cost, total_latency_ms, total_tokens = 0.0, 0.0, 0
         had_error = False
+        stage_reports = []  # compact {stage, method, eval_reference_free} -- feeds diagnose() below
         try:
             for item in pipeline.answer_query(req.query, reference=req.reference):
                 if isinstance(item, StageReport):
                     total_cost += item.trace.cost_usd
                     total_latency_ms += item.trace.latency_ms
                     total_tokens += item.trace.tokens
+                    stage_reports.append({"stage": item.stage, "method": item.method,
+                                           "eval_reference_free": item.eval_reference_free})
                 had_error = had_error or isinstance(item, StageError)
                 q.put(item)
+            diagnosis = None if had_error else diagnose(stage_reports)
             q.put({"type": "done", "answer": None if had_error else pipeline.answer,
                    "total_cost_usd": round(total_cost, 6), "total_latency_ms": round(total_latency_ms, 1),
-                   "total_tokens": total_tokens})
+                   "total_tokens": total_tokens, "diagnosis": diagnosis,
+                   "stage_reports": stage_reports})  # handed back verbatim if the user asks for a deep-dive
         except Exception as e:
             q.put(e)
         finally:
@@ -260,7 +319,10 @@ class RewriteRequest(BaseModel):
 
 @app.post("/llm/rewrite-prompt")
 def rewrite_prompt(req: RewriteRequest):
-    resp = llm_clients.rewrite_system_prompt(req.prompt, req.provider, req.api_key, req.model)
+    api_key = _with_env_fallback({req.provider: req.api_key}).get(req.provider)
+    if not api_key:
+        raise HTTPException(400, f"Missing {req.provider} API key -- add it in the API keys panel and try again.")
+    resp = llm_clients.rewrite_system_prompt(req.prompt, req.provider, api_key, req.model)
     return {"text": resp.text, "tokens": resp.input_tokens + resp.output_tokens, "cost_usd": resp.cost_usd}
 
 
@@ -275,5 +337,26 @@ class SuggestRequest(BaseModel):
 
 @app.post("/llm/suggest")
 def suggest(req: SuggestRequest):
-    resp = llm_clients.suggest_option(req.stage, req.options, req.context, req.provider, req.api_key, req.model)
+    api_key = _with_env_fallback({req.provider: req.api_key}).get(req.provider)
+    if not api_key:
+        raise HTTPException(400, f"Missing {req.provider} API key -- add it in the API keys panel and try again.")
+    resp = llm_clients.suggest_option(req.stage, req.options, req.context, req.provider, api_key, req.model)
     return {"text": resp.text, "tokens": resp.input_tokens + resp.output_tokens, "cost_usd": resp.cost_usd}
+
+
+class DeepDiveRequest(BaseModel):
+    query: str
+    stage_reports: list[dict]  # the same compact per-stage list the "done" SSE event carried
+    provider: str
+    api_key: str
+
+
+@app.post("/diagnose/deep")
+def diagnose_deep(req: DeepDiveRequest):
+    """On-demand narrative diagnosis (real LLM cost) -- only called when the
+    user clicks 'Deep-dive' on a low-scoring run's rule-based diagnosis."""
+    api_key = _with_env_fallback({req.provider: req.api_key}).get(req.provider)
+    if not api_key:
+        raise HTTPException(400, f"Missing {req.provider} API key -- add it in the API keys panel and try again.")
+    text = deep_dive(req.query, req.stage_reports, req.provider, api_key)
+    return {"text": text}

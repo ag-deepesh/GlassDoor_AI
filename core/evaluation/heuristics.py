@@ -16,6 +16,11 @@ from core.schemas import ParsedDoc, Chunk
 from core.retrieval.base import RetrievedItem
 
 
+def _snippet(text: str, limit: int = 160) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
 def parsing_report(docs: list[ParsedDoc]) -> dict:
     total_words = sum(len(d.full_text.split()) for d in docs)
     total_images = sum(len(d.images) for d in docs)
@@ -55,8 +60,14 @@ def chunking_report(chunks: list[Chunk], target_size: int) -> dict:
         notes.append("chunks are much smaller than target -- check for excessive paragraph breaks fragmenting the text")
     recommendation = " · ".join(notes) if notes else "Chunk sizes are consistent and close to target -- no changes needed."
 
+    largest = max(chunks, key=lambda c: c.n_tokens)
+    smallest = min(chunks, key=lambda c: c.n_tokens)
     return {"scores": {"n_chunks": len(chunks), "mean_tokens": round(mean, 1), "std_tokens": round(std, 1)},
-            "recommendation": recommendation}
+            "recommendation": recommendation,
+            "examples": {
+                "largest": {"id": largest.chunk_id, "n_tokens": largest.n_tokens, "text": _snippet(largest.text)},
+                "smallest": {"id": smallest.chunk_id, "n_tokens": smallest.n_tokens, "text": _snippet(smallest.text)},
+            }}
 
 
 def embedding_report(n_vectors: int, dim: int, n_images: int = 0) -> dict:
@@ -82,6 +93,14 @@ def retrieval_report(items: list[RetrievedItem]) -> dict:
         notes.append("even the top result scores low -- the answer may not be in the corpus, or try Hybrid-RRF")
     recommendation = " · ".join(notes) if notes else "Retrieved scores look healthy and tightly clustered."
 
+    ranked = sorted(items, key=lambda i: i.score, reverse=True)
+    top_item, bottom_item = ranked[0], ranked[-1]
     return {"scores": {"n_results": len(items), "top_score": round(top, 3), "score_floor": round(floor, 3),
                         "n_images": n_images},
-            "recommendation": recommendation}
+            "recommendation": recommendation,
+            "examples": {
+                "top": {"id": top_item.id, "kind": top_item.kind, "score": round(top_item.score, 3),
+                        "text": _snippet(top_item.text)},
+                "bottom": {"id": bottom_item.id, "kind": bottom_item.kind, "score": round(bottom_item.score, 3),
+                           "text": _snippet(bottom_item.text)},
+            }}

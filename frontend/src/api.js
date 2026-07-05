@@ -1,7 +1,11 @@
 // Thin fetch client for the FastAPI backend (api/main.py). SSE is parsed by
 // hand here rather than via the browser's EventSource, because EventSource
 // can't send a POST body -- both /kbs/build and /query need one (files/config).
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+
+export function kbImageUrl(kbName, imageId) {
+  return `${API_BASE}/kbs/${encodeURIComponent(kbName)}/images/${encodeURIComponent(imageId)}`;
+}
 
 async function streamSSE(response, onEvent) {
   if (!response.ok) {
@@ -37,9 +41,30 @@ function cleanKeys(keys) {
   return Object.fromEntries(Object.entries(keys || {}).filter(([, v]) => v));
 }
 
+// Extracts FastAPI's HTTPException detail message when present, so the UI
+// can show "Missing gemini API key -- ..." instead of a bare status code.
+async function errorMessage(res, fallback) {
+  const text = await res.text().catch(() => "");
+  try {
+    const detail = JSON.parse(text)?.detail;
+    if (detail) return typeof detail === "string" ? detail : JSON.stringify(detail);
+  } catch {
+    // not JSON -- fall through to the raw text/fallback below
+  }
+  return text || fallback;
+}
+
 export async function getRegistry() {
   const res = await fetch(`${API_BASE}/registry`);
   if (!res.ok) throw new Error(`Failed to load registry: ${res.status}`);
+  return res.json();
+}
+
+// Which providers already have a usable key on the server (from its .env) --
+// lets the UI skip asking the user for a key it doesn't actually need.
+export async function getAvailableProviders() {
+  const res = await fetch(`${API_BASE}/config/providers`);
+  if (!res.ok) throw new Error(`Failed to load provider config: ${res.status}`);
   return res.json();
 }
 
@@ -81,7 +106,7 @@ export async function rewritePrompt({ prompt, provider, apiKey, model }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prompt, provider, api_key: apiKey, model }),
   });
-  if (!res.ok) throw new Error(`Rewrite failed: ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res, `Rewrite failed: ${res.status}`));
   return res.json();
 }
 
@@ -91,6 +116,16 @@ export async function suggestOption({ stage, options, context, provider, apiKey,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stage, options, context, provider, api_key: apiKey, model }),
   });
-  if (!res.ok) throw new Error(`Suggest failed: ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res, `Suggest failed: ${res.status}`));
+  return res.json();
+}
+
+export async function diagnoseDeep({ query, stageReports, provider, apiKey }) {
+  const res = await fetch(`${API_BASE}/diagnose/deep`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, stage_reports: stageReports, provider, api_key: apiKey }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, `Deep-dive failed: ${res.status}`));
   return res.json();
 }

@@ -9,8 +9,10 @@ default) -- the UI holds them in memory only, per the platform's own
 credential-handling rule.
 """
 from __future__ import annotations
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -23,7 +25,10 @@ class LLMResponse:
 
 class BaseLLMClient(ABC):
     @abstractmethod
-    def chat(self, system: str, user: str, model: str, max_tokens: int = 1024) -> LLMResponse: ...
+    def chat(self, system: str, user: str, model: str, max_tokens: int = 1024,
+              history: list[dict] | None = None, temperature: float | None = None,
+              top_p: float | None = None, top_k: int | None = None,
+              images: list[Path] | None = None) -> LLMResponse: ...
 
     @abstractmethod
     def caption_image(self, image_path, model: str) -> LLMResponse: ...
@@ -46,28 +51,52 @@ def _cost(model: str, in_tok: int, out_tok: int) -> float:
     return round(in_tok / 1000 * rates[0] + out_tok / 1000 * rates[1], 6)
 
 
+def _image_block_anthropic(image_path: Path) -> dict:
+    import base64
+    media_type = "image/png" if str(image_path).endswith("png") else "image/jpeg"
+    b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+
+
+def _image_block_openai(image_path: Path) -> dict:
+    import base64
+    media_type = "image/png" if str(image_path).endswith("png") else "image/jpeg"
+    b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+    return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}}
+
+
 class ClaudeClient(BaseLLMClient):
     def __init__(self, api_key: str):
         import anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
 
-    def chat(self, system: str, user: str, model: str = "claude-sonnet-4-6", max_tokens: int = 1024) -> LLMResponse:
+    def chat(self, system: str, user: str, model: str = "claude-sonnet-4-6", max_tokens: int = 1024,
+              history: list[dict] | None = None, temperature: float | None = None,
+              top_p: float | None = None, top_k: int | None = None,
+              images: list[Path] | None = None) -> LLMResponse:
+        user_content = user
+        if images:
+            user_content = [_image_block_anthropic(p) for p in images] + [{"type": "text", "text": user}]
+        messages = [*(history or []), {"role": "user", "content": user_content}]
+        kwargs = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if top_k is not None:
+            kwargs["top_k"] = top_k
         resp = self._client.messages.create(
-            model=model, max_tokens=max_tokens, system=system,
-            messages=[{"role": "user", "content": user}],
+            model=model, max_tokens=max_tokens, system=system, messages=messages, **kwargs,
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
         return LLMResponse(text, resp.usage.input_tokens, resp.usage.output_tokens,
                             _cost(model, resp.usage.input_tokens, resp.usage.output_tokens))
 
     def caption_image(self, image_path, model: str = "claude-sonnet-4-6") -> LLMResponse:
-        import base64
-        media_type = "image/png" if str(image_path).endswith("png") else "image/jpeg"
-        b64 = base64.b64encode(open(image_path, "rb").read()).decode()
         resp = self._client.messages.create(
             model=model, max_tokens=200,
             messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                _image_block_anthropic(image_path),
                 {"type": "text", "text": "Caption this image in one factual sentence, for retrieval indexing."},
             ]}],
         )
@@ -82,9 +111,35 @@ class GeminiClient(BaseLLMClient):
         genai.configure(api_key=api_key)
         self._genai = genai
 
-    def chat(self, system: str, user: str, model: str = "gemini-2.5-flash", max_tokens: int = 1024) -> LLMResponse:
+    @staticmethod
+    def _to_gemini_history(history: list[dict] | None) -> list[dict]:
+        """Gemini's chat history uses role 'model' where everyone else says
+        'assistant', and each turn's content must be a list of parts."""
+        if not history:
+            return []
+        return [{"role": "model" if h["role"] == "assistant" else "user", "parts": [h["content"]]}
+                for h in history]
+
+    def chat(self, system: str, user: str, model: str = "gemini-2.5-flash", max_tokens: int = 1024,
+              history: list[dict] | None = None, temperature: float | None = None,
+              top_p: float | None = None, top_k: int | None = None,
+              images: list[Path] | None = None) -> LLMResponse:
         m = self._genai.GenerativeModel(model, system_instruction=system)
-        resp = m.generate_content(user, generation_config={"max_output_tokens": max_tokens})
+        gen_config = {"max_output_tokens": max_tokens}
+        if temperature is not None:
+            gen_config["temperature"] = temperature
+        if top_p is not None:
+            gen_config["top_p"] = top_p
+        if top_k is not None:
+            gen_config["top_k"] = top_k
+
+        user_parts = [user]
+        if images:
+            from PIL import Image
+            user_parts = [Image.open(p) for p in images] + [user]
+
+        chat = m.start_chat(history=self._to_gemini_history(history))
+        resp = chat.send_message(user_parts, generation_config=gen_config)
         usage = getattr(resp, "usage_metadata", None)
         in_tok = getattr(usage, "prompt_token_count", 0) or 0
         out_tok = getattr(usage, "candidates_token_count", 0) or 0
@@ -109,23 +164,33 @@ class OpenAIClient(BaseLLMClient):
         import openai
         self._client = openai.OpenAI(api_key=api_key)
 
-    def chat(self, system: str, user: str, model: str = "gpt-4o-mini", max_tokens: int = 1024) -> LLMResponse:
-        resp = self._client.chat.completions.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
+    def chat(self, system: str, user: str, model: str = "gpt-4o-mini", max_tokens: int = 1024,
+              history: list[dict] | None = None, temperature: float | None = None,
+              top_p: float | None = None, top_k: int | None = None,
+              images: list[Path] | None = None) -> LLMResponse:
+        # OpenAI's chat-completions API has no top_k knob -- silently ignored,
+        # the UI grays this field out for openai/groq so it's not a broken promise.
+        user_content = user
+        if images:
+            user_content = [{"type": "text", "text": user}] + [_image_block_openai(p) for p in images]
+        messages = [{"role": "system", "content": system}, *(history or []),
+                    {"role": "user", "content": user_content}]
+        kwargs = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        resp = self._client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages, **kwargs)
         u = resp.usage
         return LLMResponse(resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens,
                             _cost(model, u.prompt_tokens, u.completion_tokens))
 
     def caption_image(self, image_path, model: str = "gpt-4o-mini") -> LLMResponse:
-        import base64
-        b64 = base64.b64encode(open(image_path, "rb").read()).decode()
         resp = self._client.chat.completions.create(
             model=model, max_tokens=200,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Caption this image in one factual sentence, for retrieval indexing."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                _image_block_openai(image_path),
             ]}],
         )
         u = resp.usage
@@ -141,24 +206,32 @@ class GroqClient(BaseLLMClient):
         import openai
         self._client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
-    def chat(self, system: str, user: str, model: str = "llama-3.1-8b-instant", max_tokens: int = 1024) -> LLMResponse:
-        resp = self._client.chat.completions.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
+    def chat(self, system: str, user: str, model: str = "llama-3.1-8b-instant", max_tokens: int = 1024,
+              history: list[dict] | None = None, temperature: float | None = None,
+              top_p: float | None = None, top_k: int | None = None,
+              images: list[Path] | None = None) -> LLMResponse:
+        # Same as OpenAI: no top_k on this API.
+        user_content = user
+        if images:
+            user_content = [{"type": "text", "text": user}] + [_image_block_openai(p) for p in images]
+        messages = [{"role": "system", "content": system}, *(history or []),
+                    {"role": "user", "content": user_content}]
+        kwargs = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        resp = self._client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages, **kwargs)
         u = resp.usage
         return LLMResponse(resp.choices[0].message.content, u.prompt_tokens, u.completion_tokens,
                             _cost(model, u.prompt_tokens, u.completion_tokens))
 
     def caption_image(self, image_path, model: str = "meta-llama/llama-4-scout-17b-16e-instruct") -> LLMResponse:
-        import base64
-        media_type = "image/png" if str(image_path).endswith("png") else "image/jpeg"
-        b64 = base64.b64encode(open(image_path, "rb").read()).decode()
         resp = self._client.chat.completions.create(
             model=model, max_tokens=200,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": "Caption this image in one factual sentence, for retrieval indexing."},
-                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}},
+                _image_block_openai(image_path),
             ]}],
         )
         u = resp.usage
@@ -196,6 +269,21 @@ def rewrite_system_prompt(current_prompt: str, provider: str, api_key: str, mode
     )
     kwargs = {"model": model} if model else {}
     return client.chat(system, current_prompt, **kwargs)
+
+
+def score_image_relevance(provider: str, api_key: str, query: str, image_path, model: str | None = None) -> float:
+    """The optional 'vision-LLM relevance scoring' reranking toggle: a cheap
+    vision call judging one (query, image) pair on what the image actually
+    shows, not just its caption. Reply parsing is defensive -- providers
+    won't always obey 'number only' -- and falls back to a neutral 0.5
+    rather than crashing the rerank pass over one bad response."""
+    client = get_client(provider, api_key)
+    system = ("Rate how relevant this image is to answering the question, on a 0.0-1.0 scale "
+              "(1.0 = directly answers it, 0.0 = completely unrelated). Reply with ONLY the number.")
+    kwargs = {"model": model} if model else {}
+    resp = client.chat(system, query, max_tokens=8, images=[image_path], **kwargs)
+    match = re.search(r"\d*\.?\d+", resp.text)
+    return max(0.0, min(1.0, float(match.group()))) if match else 0.5
 
 
 def suggest_option(stage: str, options: list[str], context: str, provider: str, api_key: str,

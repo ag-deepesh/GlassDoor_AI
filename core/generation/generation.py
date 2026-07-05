@@ -4,10 +4,15 @@ from core.registry import register
 from core.llm_clients import get_client, LLMResponse
 from core.retrieval.base import RetrievedItem
 
+# Vision-capable models -- vision_grounded only actually attaches image bytes
+# for these; other models silently fall back to caption-only text (the image
+# context item is still cited by id, just described rather than seen).
+_VISION_CAPABLE = {"claude", "gemini", "openai"}
+
 
 class BaseGenerator(ABC):
     @abstractmethod
-    def generate(self, system_prompt: str, query: str, contexts: list[RetrievedItem]) -> LLMResponse: ...
+    def generate(self, system_prompt: str, query: str, contexts: list[RetrievedItem], **kwargs) -> LLMResponse: ...
 
     @staticmethod
     def _format_contexts(contexts: list[RetrievedItem]) -> str:
@@ -26,9 +31,24 @@ class _ProviderGenerator(BaseGenerator):
         self._client = get_client(self._provider, api_key)
         self._model = model or self._default_model
 
-    def generate(self, system_prompt: str, query: str, contexts: list[RetrievedItem]) -> LLMResponse:
+    def generate(self, system_prompt: str, query: str, contexts: list[RetrievedItem],
+                 history: list[dict] | None = None, vision_grounded: bool = False,
+                 temperature: float | None = None, top_p: float | None = None,
+                 top_k: int | None = None, max_tokens: int = 1024) -> LLMResponse:
+        # Every context item's caption/text still goes in as before (so
+        # citations like [img#id] always work); vision_grounded additionally
+        # attaches the actual image bytes for image-kind items, on models
+        # that can read them, so the answer can depend on what the figure
+        # actually shows rather than just its caption.
+        image_paths = None
+        if vision_grounded and self._provider in _VISION_CAPABLE:
+            image_paths = [c.meta.get("path") for c in contexts if c.kind == "image" and c.meta.get("path")]
+            image_paths = image_paths or None
+
         user_msg = f"Context:\n{self._format_contexts(contexts)}\n\nQuestion: {query}"
-        return self._client.chat(system_prompt, user_msg, model=self._model)
+        return self._client.chat(system_prompt, user_msg, model=self._model, max_tokens=max_tokens,
+                                  history=history, temperature=temperature, top_p=top_p, top_k=top_k,
+                                  images=image_paths)
 
 
 @register("generation", "claude-sonnet")

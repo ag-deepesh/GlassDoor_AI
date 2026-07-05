@@ -97,6 +97,7 @@ class Pipeline:
         self.docs = []
         self.chunks = []
         self.text_embedder = None
+        self._clip_embedder = None  # lazy -- only loaded if image_embedding_method is clip-local
         self.retrieved: list[RetrievedItem] = []
         self.reranked: list[RetrievedItem] = []
         self.answer = None
@@ -161,6 +162,20 @@ class Pipeline:
         if not api_key:
             raise ValueError(f"Missing {provider} API key -- add it in the API keys panel and try again.")
         return embedder_cls(api_key)
+
+    def _image_query_embedding(self, query: str) -> list[float]:
+        """Images embedded via clip-local live in CLIP's own vector space --
+        querying them with the text embedder's vectors would silently compare
+        two incompatible spaces. Route the query through CLIP's text tower in
+        that case; otherwise (caption-text-embed) images share the text
+        embedder's space, so the query vector already computed for text
+        retrieval is reused as-is."""
+        if self.config.image_embedding_method == "clip-local":
+            from core.embedding.image_caption import CLIPEmbedder
+            if self._clip_embedder is None:
+                self._clip_embedder = CLIPEmbedder()
+            return self._clip_embedder.embed_query_text(query)
+        return self.text_embedder.embed([query])[0]
 
     def _save_kb_metadata(self, input_dir: Path) -> None:
         n_images = sum(len(d.images) for d in self.docs)
@@ -234,6 +249,13 @@ class Pipeline:
             all_images = [img for d in self.docs for img in d.images]
             img_vectors = img_embedder.embed_images(all_images)
             self.store.add_images(all_images, img_vectors)
+        elif n_images and cfg.image_embedding_method == "clip-local":
+            from core.embedding.image_caption import CLIPEmbedder
+            if self._clip_embedder is None:
+                self._clip_embedder = CLIPEmbedder()
+            all_images = [img for d in self.docs for img in d.images]
+            img_vectors = self._clip_embedder.embed_images(all_images)
+            self.store.add_images(all_images, img_vectors)
 
         report = heuristics.embedding_report(len(vectors), self.text_embedder.dim if vectors else 0, n_images)
         return self._report("embedding", cfg.embedding_method, t0, f"{len(texts)} chunks",
@@ -273,8 +295,12 @@ class Pipeline:
 
         image_items = []
         if cfg.result_mode != "text-only":
-            q_emb = self.text_embedder.embed([query])[0]
-            image_items = query_images(self.store, q_emb, top_k=4)
+            # Wider than rerank_keep_top on purpose -- reranking (which now
+            # scores images against the same budget as text) needs real
+            # candidates to choose between, not a pre-culled fixed 4 that it
+            # then passes through untouched.
+            q_emb = self._image_query_embedding(query)
+            image_items = query_images(self.store, q_emb, top_k=cfg.image_candidate_k)
         self.retrieved = merge_results(text_items, image_items, mode=cfg.result_mode)
 
         report = heuristics.retrieval_report(self.retrieved)
@@ -294,9 +320,24 @@ class Pipeline:
         reranker_cls = get("reranking", cfg.reranking_method)
         reranker = reranker_cls()
         pre_rerank = self.retrieved
-        self.reranked = reranker.rerank(query, self.retrieved, keep_top=cfg.rerank_keep_top)
+
+        vision_scorer, vision_warning = None, None
+        if cfg.vision_rerank_enabled:
+            vision_key = cfg.api_keys.get(cfg.caption_provider)
+            if vision_key:
+                from core.llm_clients import score_image_relevance
+                provider = cfg.caption_provider
+                vision_scorer = lambda q, path: score_image_relevance(provider, vision_key, q, path)
+            else:
+                vision_warning = (f"Vision-rerank skipped: no API key configured for "
+                                   f"'{cfg.caption_provider}' -- images kept their prior score.")
+
+        self.reranked = reranker.rerank(query, self.retrieved, keep_top=cfg.rerank_keep_top,
+                                         vision_scorer=vision_scorer)
 
         report = heuristics.retrieval_report(self.reranked)  # same shape of report, post-rerank
+        if vision_warning:
+            report["recommendation"] = f"{vision_warning} · {report['recommendation']}"
         out = self._report("reranking", cfg.reranking_method, t0, f"{len(self.retrieved)} candidates",
                             f"{len(self.reranked)} kept", ref_free=report)
         out.trace.extra["items"] = self._items_for_trace(self.reranked, query=query, prev_items=pre_rerank)
@@ -308,7 +349,9 @@ class Pipeline:
         gen_cls = get("generation", cfg.generation_method)
         provider = gen_cls._provider
         generator = gen_cls(cfg.api_keys[provider])
-        resp = generator.generate(cfg.system_prompt, query, self.reranked)
+        resp = generator.generate(cfg.system_prompt, query, self.reranked, history=cfg.history,
+                                   vision_grounded=cfg.vision_grounded, temperature=cfg.temperature,
+                                   top_p=cfg.top_p, top_k=cfg.gen_top_k, max_tokens=cfg.max_tokens)
         self.answer = resp.text
 
         ref_free, ref_based = None, None
